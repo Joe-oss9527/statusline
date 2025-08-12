@@ -5,14 +5,14 @@ A Python-based weather statusline for [Claude Code](https://docs.anthropic.com/e
 ## Features
 
 * **智能地点切换**: 工作时间自动显示西湖区天气，其他时间显示下沙大学城
-* **全面天气信息**: 实时温度、体感温度、天气现象、风向风速、分钟级降水预报、空气质量、明日预报
+* **全面天气信息**: 当前时间、实时温度、体感温度、天气现象、风向风速、分钟级降水预报、空气质量、明日预报
 * **QWeather v7 API**: 使用 [QWeather](https://dev.qweather.com/docs) 最新 API 与 JWT 认证
 * **Claude Code 集成**: 专为 [Claude Code statusline](https://docs.anthropic.com/en/docs/claude-code/statusline) 设计
 
 ## Sample Output
 
 ```
-Sonnet 4  statusline | 西湖区 | 32°C（体感35°） 多云 | 东南风 12km/h | 25分钟后下雨 | AQI 87 良 | 明日 27~33°C 多云转小雨 | 东南风 14km/h | 降水1.2mm
+14:25 | Sonnet 4  statusline | 西湖区 | 32°C（体感35°） 多云 | 东南风 12km/h | 25分钟后下雨 | AQI 87 良 | 明日 27~33°C 多云转小雨 | 东南风 14km/h | 降水1.2mm
 ```
 
 ## Key Features

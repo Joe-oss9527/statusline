@@ -614,8 +614,10 @@ def main():
     else:
         ORANGE = DIM = RESET = ''
     
-    # Build header
-    header = f"{ORANGE}{context['model']}{RESET} {DIM}{context['dir']}{RESET}"
+    # Build header with current time and clock icon
+    current_time = datetime.now().strftime('%H:%M')
+    clock_icon = "⏰"  # Clock emoji (better visibility than pure ASCII)
+    header = f"{clock_icon} {current_time} | {ORANGE}{context['model']}{RESET} {DIM}{context['dir']}{RESET}"
     if context['branch']:
         header += f" | {context['branch']}"
     
