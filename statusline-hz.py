@@ -57,16 +57,16 @@ class Config:
                                                      Path.home() / '.claude' / 'statusline.site'))
         self.cache_dir_base = Path.home() / '.cache' / 'claude-statusline'
         
-        # Cache TTLs (seconds)
-        self.ttl_now = int(os.environ.get('QWEATHER_TTL_NOW_SEC', '180'))
-        self.ttl_min = int(os.environ.get('QWEATHER_TTL_MIN_SEC', '180'))
-        self.ttl_aqi = int(os.environ.get('QWEATHER_TTL_AQI_SEC', '300'))
-        self.ttl_daily = int(os.environ.get('QWEATHER_TTL_DAILY_SEC', '3600'))
+        # Cache TTLs (seconds) - optimized for better performance
+        self.ttl_now = int(os.environ.get('QWEATHER_TTL_NOW_SEC', '300'))
+        self.ttl_min = int(os.environ.get('QWEATHER_TTL_MIN_SEC', '300'))
+        self.ttl_aqi = int(os.environ.get('QWEATHER_TTL_AQI_SEC', '600'))
+        self.ttl_daily = int(os.environ.get('QWEATHER_TTL_DAILY_SEC', '1800'))
         
-        # Logging
-        self.log_level = os.environ.get('STATUSLINE_LOG_LEVEL', 'INFO')
+        # Logging - default to WARNING for better performance
+        self.log_level = os.environ.get('STATUSLINE_LOG_LEVEL', 'WARNING')
         self.log_dir = Path.home() / '.cache' / 'claude-statusline' / 'logs'
-        
+
         # Debug Mode
         self.debug = os.environ.get('STATUSLINE_DEBUG', '0') == '1'
         
@@ -423,23 +423,17 @@ class WeatherParser:
     
     @staticmethod
     def parse_now(data: Optional[Dict[str, Any]]) -> Dict[str, str]:
-        """Parse current weather data"""
+        """Parse current weather data - simplified for better readability"""
         result = {
             'temp': '--',
-            'feels': '--',
-            'desc': '--',
-            'windDir': '--',
-            'windSpeed': '--'
+            'desc': '--'
         }
-        
+
         if data and 'now' in data:
             now = data['now']
             result['temp'] = str(now.get('temp', '--'))
-            result['feels'] = str(now.get('feelsLike', '--'))
             result['desc'] = now.get('text', '--')
-            result['windDir'] = now.get('windDir', '--')
-            result['windSpeed'] = str(now.get('windSpeed', '--'))
-        
+
         return result
     
     @staticmethod
@@ -477,94 +471,101 @@ class WeatherParser:
     
     @staticmethod
     def parse_daily(data: Optional[Dict[str, Any]]) -> str:
-        """Parse daily forecast for tomorrow"""
+        """Parse daily forecast for tomorrow - simplified"""
         if not data or 'daily' not in data:
-            return '--'
-        
+            return ''
+
         tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-        
+
         for day in data['daily']:
             if day.get('fxDate') == tomorrow:
                 tmin = day.get('tempMin', '--')
                 tmax = day.get('tempMax', '--')
                 dday = day.get('textDay', '--')
                 dnight = day.get('textNight', '--')
-                wdir = day.get('windDirDay', '--')
-                wspeed = day.get('windSpeedDay', '--')
-                precip = float(day.get('precip', 0))
-                
+
+                # Simplified: just show temp range and weather
                 if dday == dnight:
-                    result = f"明日 {tmin}~{tmax}°C {dday} | {wdir} {wspeed}km/h"
+                    return f"明日{tmin}~{tmax}°C {dday}"
                 else:
-                    result = f"明日 {tmin}~{tmax}°C {dday}转{dnight} | {wdir} {wspeed}km/h"
-                if precip > 0:
-                    result += f" | 降水{precip}mm"
-                
-                return result
-        
-        return '--'
+                    return f"明日{tmin}~{tmax}°C {dday}转{dnight}"
+
+        return ''
     
     @staticmethod
     def parse_aqi(data: Optional[Dict[str, Any]]) -> str:
-        """Parse AQI data"""
+        """Parse AQI data - simplified to show only value"""
         if not data:
             return ''
-        
+
         # Try China AQI format
         if 'now' in data and 'aqi' in data['now']:
             aqi = data['now'].get('aqi', '--')
-            category = data['now'].get('category', '')
-            return f" | AQI {aqi} {category}"
-        
+            # Only show AQI number for brevity
+            return f"AQI{aqi}"
+
         # Try global AQI format
         if 'indexes' in data:
             for index in data['indexes']:
                 if index.get('code') in ['cn-mee', 'cn-mee-1h']:
                     aqi = index.get('aqiDisplay', '--')
-                    category = index.get('category', '')
-                    return f" | AQI {aqi} {category}"
-            
+                    return f"AQI{aqi}"
+
             # Fallback to first index
             if data['indexes']:
                 aqi = data['indexes'][0].get('aqiDisplay', '--')
-                category = data['indexes'][0].get('category', '')
-                return f" | AQI {aqi} {category}"
-        
+                return f"AQI{aqi}"
+
         return ''
 
 # ===================== Claude Context Parser =====================
-def parse_claude_context() -> Dict[str, str]:
+def parse_claude_context() -> Dict[str, Any]:
     """Parse Claude Code context from stdin"""
     result = {
         'model': 'Claude',
         'dir': '.',
-        'branch': ''
+        'branch': '',
+        'cost': None,
+        'duration': None
     }
-    
+
     try:
         input_data = sys.stdin.read()
         if input_data:
             data = json.loads(input_data)
-            
+
             # Parse model
             if 'model' in data:
                 result['model'] = data['model'].get('display_name') or data['model'].get('id', 'Claude')
-            
+
             # Parse directory
             if 'workspace' in data:
                 cwd = data['workspace'].get('current_dir', '.')
                 result['dir'] = Path(cwd).name
-                
+
                 # Check for git branch
                 git_head = Path(cwd) / '.git' / 'HEAD'
                 if git_head.exists():
                     content = git_head.read_text().strip()
                     if content.startswith('ref: '):
                         result['branch'] = content.split('/')[-1]
-    
+
+            # Parse cost metrics (important for tracking usage)
+            if 'cost' in data:
+                cost_usd = data['cost'].get('usd')
+                if cost_usd is not None:
+                    result['cost'] = f"${cost_usd:.3f}"
+
+                # Parse duration
+                duration_sec = data['cost'].get('duration_sec')
+                if duration_sec is not None and duration_sec > 0:
+                    minutes = int(duration_sec // 60)
+                    if minutes > 0:
+                        result['duration'] = f"{minutes}m"
+
     except Exception as e:
         logging.debug(f"Failed to parse Claude context: {e}")
-    
+
     return result
 
 # ===================== Main Function =====================
@@ -606,36 +607,57 @@ def main():
     daily_text = parser.parse_daily(data.get('daily'))
     aqi_text = parser.parse_aqi(data.get('aqi'))
     
-    # Format output
+    # Format output with colors
     if not config.no_color:
-        ORANGE = '\033[38;5;208m'
-        DIM = '\033[2m'
+        ORANGE = '\033[38;5;208m'  # Model name
+        CYAN = '\033[38;5;51m'     # Cost/metrics
+        DIM = '\033[2m'            # Directory
+        GREEN = '\033[38;5;46m'    # Weather info
         RESET = '\033[0m'
     else:
-        ORANGE = DIM = RESET = ''
-    
-    # Build header with current time and clock icon
+        ORANGE = CYAN = DIM = GREEN = RESET = ''
+
+    # Build header with current time
     current_time = datetime.now().strftime('%H:%M')
-    clock_icon = "⏰"  # Clock emoji (better visibility than pure ASCII)
-    header = f"{clock_icon} {current_time} | {ORANGE}{context['model']}{RESET} {DIM}{context['dir']}{RESET}"
+    header = f"⏰ {current_time}"
+
+    # Add model info
+    header += f" | {ORANGE}{context['model']}{RESET}"
+
+    # Add directory and branch
+    header += f" {DIM}{context['dir']}{RESET}"
     if context['branch']:
-        header += f" | {context['branch']}"
-    
-    # Build weather part
-    auth_tag = " | Auth?" if not jwt_token else ""
-    
-    wx_part = (f"{place} | {now_data['temp']}°C（体感{now_data['feels']}°） {now_data['desc']} | "
-               f"{now_data['windDir']} {now_data['windSpeed']}km/h | {minutely_text}{aqi_text} | "
-               f"{daily_text}{auth_tag}")
-    
+        header += f":{context['branch']}"
+
+    # Add cost metrics if available
+    metrics = []
+    if context.get('cost'):
+        metrics.append(f"{CYAN}{context['cost']}{RESET}")
+    if context.get('duration'):
+        metrics.append(f"{CYAN}{context['duration']}{RESET}")
+    if metrics:
+        header += f" [{' '.join(metrics)}]"
+
+    # Build weather part (simplified and compact)
+    weather_parts = []
+    weather_parts.append(f"{GREEN}{place}{RESET}")
+    weather_parts.append(f"{now_data['temp']}°C {now_data['desc']}")
+    weather_parts.append(minutely_text)
+    if aqi_text:
+        weather_parts.append(aqi_text)
+    if daily_text:
+        weather_parts.append(daily_text)
+
+    wx_part = " | ".join(weather_parts)
+
     # Ensure output even on error
-    if not wx_part or wx_part == " | ":
-        wx_part = f"Status loading... | {datetime.now().strftime('%H:%M')}"
-    
-    # Output
+    if not wx_part or wx_part.strip() == "|":
+        wx_part = f"Status loading..."
+
+    # Output (first line only, as per official docs)
     print(f"{header} | {wx_part}")
-    
-    logging.info(f"Status output: {wx_part}")
+
+    logging.info(f"Status displayed successfully")
     logging.info("Execution completed")
 
 if __name__ == "__main__":
