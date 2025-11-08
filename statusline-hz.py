@@ -280,14 +280,14 @@ def main():
     tracker = StatsTracker(config)
     trend_arrow = tracker.get_trend_arrow(context['lines_added'], context['lines_removed'])
 
-    # Format output with colors
+    # Format output with colors (eye-friendly palette)
     if not config.no_color:
-        ORANGE = '\033[38;5;208m'    # Model name
-        CYAN = '\033[38;5;51m'       # Cost/metrics
+        ORANGE = '\033[38;5;173m'    # Model name - soft orange-brown
+        CYAN = '\033[38;5;87m'       # Cost/metrics - soft cyan-green
         DIM = '\033[2m'              # Directory
-        GREEN = '\033[38;5;46m'      # Code stats
-        YELLOW = '\033[38;5;226m'    # Performance
-        RED = '\033[38;5;196m'       # Warning
+        GREEN = '\033[38;5;78m'      # Code stats - soft green
+        YELLOW = '\033[38;5;185m'    # Performance - warm yellow
+        RED = '\033[38;5;167m'       # Warning - muted red
         RESET = '\033[0m'
     else:
         ORANGE = CYAN = DIM = GREEN = YELLOW = RED = RESET = ''
