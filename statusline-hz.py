@@ -20,15 +20,21 @@ class Config:
     """Configuration management for statusline"""
     
     def __init__(self):
-        # Cost Alert Configuration
-        self.cost_threshold = float(os.environ.get('STATUSLINE_COST_THRESHOLD', '0.50'))  # Alert if cost exceeds $0.50
+        # Cost Alert Configuration - with error handling
+        try:
+            self.cost_threshold = float(os.environ.get('STATUSLINE_COST_THRESHOLD', '0.50'))
+        except (ValueError, TypeError):
+            self.cost_threshold = 0.50  # Fallback to default
 
         # Cache directory for trends
         self.cache_dir_base = Path.home() / '.cache' / 'claude-statusline'
         self.stats_cache_file = self.cache_dir_base / 'session_stats.json'
 
         # Logging - default to WARNING for better performance
-        self.log_level = os.environ.get('STATUSLINE_LOG_LEVEL', 'WARNING')
+        log_level_str = os.environ.get('STATUSLINE_LOG_LEVEL', 'WARNING').upper()
+        # Validate log level
+        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'OFF']
+        self.log_level = log_level_str if log_level_str in valid_levels else 'WARNING'
         self.log_dir = Path.home() / '.cache' / 'claude-statusline' / 'logs'
 
         # Debug Mode
@@ -40,7 +46,11 @@ class Config:
     def validate(self) -> bool:
         """Validate configuration"""
         # Ensure cache directory exists
-        self.cache_dir_base.mkdir(parents=True, exist_ok=True)
+        try:
+            self.cache_dir_base.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            # If we can't create cache dir, continue without it
+            logging.warning(f"Failed to create cache directory: {e}")
         return True
 
 # ===================== Logging Setup =====================
@@ -49,24 +59,29 @@ def setup_logging(config: Config):
     if config.log_level == 'OFF':
         logging.disable(logging.CRITICAL)
         return
-    
-    config.log_dir.mkdir(parents=True, exist_ok=True)
-    
-    log_file = config.log_dir / f"statusline-{datetime.now().strftime('%Y%m%d')}.log"
-    
-    # Configure logging
-    logging.basicConfig(
-        level=getattr(logging, config.log_level),
-        format='[%(asctime)s] [%(levelname)s] [%(funcName)s] %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-        ] if config.log_level != 'OFF' else []
-    )
-    
-    # Log rotation (simple version - delete old logs)
-    for old_log in config.log_dir.glob("statusline-*.log*"):
-        if old_log.stat().st_mtime < time.time() - (7 * 86400):  # 7 days
-            old_log.unlink()
+
+    try:
+        config.log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = config.log_dir / f"statusline-{datetime.now().strftime('%Y%m%d')}.log"
+
+        # Configure logging (log_level already validated in Config)
+        logging.basicConfig(
+            level=getattr(logging, config.log_level),
+            format='[%(asctime)s] [%(levelname)s] [%(funcName)s] %(message)s',
+            handlers=[logging.FileHandler(log_file)]
+        )
+
+        # Log rotation (simple version - delete old logs)
+        for old_log in config.log_dir.glob("statusline-*.log*"):
+            try:
+                if old_log.stat().st_mtime < time.time() - (7 * 86400):  # 7 days
+                    old_log.unlink()
+            except (OSError, PermissionError):
+                pass  # Ignore errors deleting old logs
+
+    except (OSError, PermissionError):
+        # If logging setup fails, disable logging but continue
+        logging.disable(logging.CRITICAL)
 
 # ===================== Git Status Checker =====================
 class GitStatusChecker:
@@ -92,6 +107,14 @@ class GitStatusChecker:
             # If output is not empty, there are uncommitted changes
             return bool(result.stdout.strip())
 
+        except FileNotFoundError:
+            # Git is not installed or not in PATH
+            logging.debug("Git command not found")
+            return False
+        except subprocess.TimeoutExpired:
+            # Git command took too long
+            logging.debug("Git status check timed out")
+            return False
         except Exception as e:
             logging.debug(f"Failed to check git status: {e}")
             return False
@@ -197,15 +220,20 @@ def parse_claude_context() -> Dict[str, Any]:
                     result['cost_usd'] = float(cost_usd)
                     result['cost_str'] = f"${cost_usd:.3f}"
 
-                # Parse duration
+                # Parse duration - show seconds if less than 1 minute
                 duration_sec = data['cost'].get('total_duration_ms') or data['cost'].get('duration_sec')
                 if duration_sec is not None and duration_sec > 0:
                     # Handle both ms and sec
                     if data['cost'].get('total_duration_ms'):
                         duration_sec = duration_sec / 1000
+
                     minutes = int(duration_sec // 60)
                     if minutes > 0:
                         result['duration'] = f"{minutes}m"
+                    else:
+                        # Show seconds for sessions under 1 minute
+                        seconds = int(duration_sec)
+                        result['duration'] = f"{seconds}s"
 
                 # Parse code change stats (THE COOLEST METRICS!)
                 lines_added = data['cost'].get('total_lines_added')
