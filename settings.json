@@ -5,24 +5,8 @@
     "padding": 0
   },
   "env": {
-    "QWEATHER_API_HOST": "https://your-api-host.qweatherapi.com",
-
-    "QWEATHER_KEY_ID": "YOUR_KEY_ID",
-    "QWEATHER_PROJECT_ID": "YOUR_PROJECT_ID",
-    "QWEATHER_PRIVATE_KEY": "~/.ssh/your-private-key.pem",
-    "QWEATHER_JWT_TTL_SEC": "900",
-
-    "STATUSLINE_TZ": "Asia/Shanghai",
-    "WORK_START": "8",
-    "WORK_END": "19",
-    "WORK_DAYS": "1-5",
-
-    "QWEATHER_TTL_NOW_SEC": "600",
-    "QWEATHER_TTL_MIN_SEC": "300",
-    "QWEATHER_TTL_AQI_SEC": "900",
-    "QWEATHER_TTL_DAILY_SEC": "3600",
-
-    "STATUSLINE_DEBUG": "1",
-    "STATUSLINE_LOG_LEVEL": "DEBUG"
+    "STATUSLINE_COST_THRESHOLD": "0.50",
+    "STATUSLINE_LOG_LEVEL": "WARNING",
+    "STATUSLINE_DEBUG": "0"
   }
 }
