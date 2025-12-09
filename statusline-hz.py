@@ -9,20 +9,64 @@ import os
 import sys
 import json
 import time
+import fcntl
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import subprocess
+
+# ===================== Constants =====================
+# Time constants
+SECONDS_PER_DAY = 86400
+CACHE_EXPIRY_SECONDS = SECONDS_PER_DAY  # 24 hours
+LOG_RETENTION_DAYS = 7
+
+# Performance thresholds (for cumulative API time in session)
+# These are higher than single-request thresholds since they're cumulative
+PERF_FAST_MS = 10000       # < 10s cumulative = green (fast session)
+PERF_MODERATE_MS = 60000   # < 60s cumulative = yellow (normal session)
+# > 60s = red (long/slow session)
+
+# Trend analysis threshold
+TREND_THRESHOLD = 0.2  # 20% change triggers trend arrow
+
+# Git settings
+GIT_TIMEOUT_SECONDS = 1
+GIT_CACHE_TTL_SECONDS = 5.0  # Cache git status for 5 seconds
+
+# ===================== Colors =====================
+class Colors:
+    """ANSI color codes for terminal output (eye-friendly palette)"""
+
+    _enabled = 'NO_COLOR' not in os.environ
+
+    ORANGE = '\033[38;5;173m' if _enabled else ''   # Model name
+    CYAN = '\033[38;5;87m' if _enabled else ''      # Cost/metrics
+    DIM = '\033[2m' if _enabled else ''             # Secondary info
+    GREEN = '\033[38;5;78m' if _enabled else ''     # Positive/fast
+    YELLOW = '\033[38;5;185m' if _enabled else ''   # Warning/moderate
+    RED = '\033[38;5;167m' if _enabled else ''      # Alert/slow
+    RESET = '\033[0m' if _enabled else ''
+
+    @classmethod
+    def disable(cls):
+        """Disable all colors"""
+        cls.ORANGE = cls.CYAN = cls.DIM = ''
+        cls.GREEN = cls.YELLOW = cls.RED = cls.RESET = ''
 
 # ===================== Configuration =====================
 class Config:
     """Configuration management for statusline"""
-    
+
+    VALID_LOG_LEVELS = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'OFF']
+
     def __init__(self):
         # Cost Alert Configuration - with error handling
         try:
             self.cost_threshold = float(os.environ.get('STATUSLINE_COST_THRESHOLD', '0.50'))
+            if self.cost_threshold < 0:
+                self.cost_threshold = 0.50
         except (ValueError, TypeError):
             self.cost_threshold = 0.50  # Fallback to default
 
@@ -32,28 +76,58 @@ class Config:
 
         # Logging - default to WARNING for better performance
         log_level_str = os.environ.get('STATUSLINE_LOG_LEVEL', 'WARNING').upper()
-        # Validate log level
-        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'OFF']
-        self.log_level = log_level_str if log_level_str in valid_levels else 'WARNING'
-        self.log_dir = Path.home() / '.cache' / 'claude-statusline' / 'logs'
+        self.log_level = log_level_str if log_level_str in self.VALID_LOG_LEVELS else 'WARNING'
+        self.log_dir = self.cache_dir_base / 'logs'
 
         # Debug Mode
         self.debug = os.environ.get('STATUSLINE_DEBUG', '0') == '1'
 
-        # Color Output
+        # Color Output - also update Colors class
         self.no_color = 'NO_COLOR' in os.environ
+        if self.no_color:
+            Colors.disable()
 
-    def validate(self) -> bool:
-        """Validate configuration"""
-        # Ensure cache directory exists
+    def ensure_directories(self) -> bool:
+        """Ensure required directories exist (initialization)"""
+        success = True
         try:
             self.cache_dir_base.mkdir(parents=True, exist_ok=True)
         except (OSError, PermissionError) as e:
-            # If we can't create cache dir, continue without it
-            logging.warning(f"Failed to create cache directory: {e}")
+            logging.warning(f"Cache directory unavailable: {e}")
+            success = False
+        return success
+
+    def is_valid(self) -> bool:
+        """Check if configuration is valid"""
+        if self.cost_threshold < 0:
+            return False
+        if self.log_level not in self.VALID_LOG_LEVELS:
+            return False
         return True
 
 # ===================== Logging Setup =====================
+def _should_run_log_cleanup(log_dir: Path) -> bool:
+    """Check if log cleanup should run (once per day)"""
+    marker_file = log_dir / '.last_cleanup'
+    try:
+        if marker_file.exists():
+            last_cleanup = marker_file.stat().st_mtime
+            if time.time() - last_cleanup < SECONDS_PER_DAY:
+                return False
+    except OSError:
+        pass
+    return True
+
+
+def _mark_cleanup_done(log_dir: Path):
+    """Mark that cleanup was performed"""
+    marker_file = log_dir / '.last_cleanup'
+    try:
+        marker_file.touch()
+    except OSError:
+        pass
+
+
 def setup_logging(config: Config):
     """Setup logging system"""
     if config.log_level == 'OFF':
@@ -71,13 +145,16 @@ def setup_logging(config: Config):
             handlers=[logging.FileHandler(log_file)]
         )
 
-        # Log rotation (simple version - delete old logs)
-        for old_log in config.log_dir.glob("statusline-*.log*"):
-            try:
-                if old_log.stat().st_mtime < time.time() - (7 * 86400):  # 7 days
-                    old_log.unlink()
-            except (OSError, PermissionError):
-                pass  # Ignore errors deleting old logs
+        # Log rotation - only run once per day for performance
+        if _should_run_log_cleanup(config.log_dir):
+            retention_cutoff = time.time() - (LOG_RETENTION_DAYS * SECONDS_PER_DAY)
+            for old_log in config.log_dir.glob("statusline-*.log*"):
+                try:
+                    if old_log.stat().st_mtime < retention_cutoff:
+                        old_log.unlink()
+                except (OSError, PermissionError):
+                    pass  # Ignore errors deleting old logs
+            _mark_cleanup_done(config.log_dir)
 
     except (OSError, PermissionError):
         # If logging setup fails, disable logging but continue
@@ -85,11 +162,30 @@ def setup_logging(config: Config):
 
 # ===================== Git Status Checker =====================
 class GitStatusChecker:
-    """Check git repository status"""
+    """Check git repository status with caching for performance"""
+
+    # Cache: {cwd: (is_dirty, timestamp)}
+    _cache: Dict[str, Tuple[bool, float]] = {}
+
+    @classmethod
+    def check_dirty_status(cls, cwd: str) -> bool:
+        """Check if git repo has uncommitted changes (with caching)"""
+        now = time.time()
+
+        # Check cache first
+        if cwd in cls._cache:
+            is_dirty, cached_at = cls._cache[cwd]
+            if now - cached_at < GIT_CACHE_TTL_SECONDS:
+                return is_dirty
+
+        # Cache miss or expired - perform actual check
+        is_dirty = cls._check_dirty_impl(cwd)
+        cls._cache[cwd] = (is_dirty, now)
+        return is_dirty
 
     @staticmethod
-    def check_dirty_status(cwd: str) -> bool:
-        """Check if git repo has uncommitted changes"""
+    def _check_dirty_impl(cwd: str) -> bool:
+        """Actual git dirty status check implementation"""
         try:
             git_dir = Path(cwd) / '.git'
             if not git_dir.exists():
@@ -101,21 +197,19 @@ class GitStatusChecker:
                 cwd=cwd,
                 capture_output=True,
                 text=True,
-                timeout=1
+                timeout=GIT_TIMEOUT_SECONDS
             )
 
             # If output is not empty, there are uncommitted changes
             return bool(result.stdout.strip())
 
         except FileNotFoundError:
-            # Git is not installed or not in PATH
             logging.debug("Git command not found")
             return False
         except subprocess.TimeoutExpired:
-            # Git command took too long
             logging.debug("Git status check timed out")
             return False
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             logging.debug(f"Failed to check git status: {e}")
             return False
 
@@ -127,21 +221,23 @@ class StatsTracker:
         self.config = config
         self.cache_file = config.stats_cache_file
 
-    def _load_previous_stats(self) -> Optional[Dict[str, int]]:
+    def _load_previous_stats(self) -> Optional[Dict[str, Any]]:
         """Load previous session stats from cache"""
         try:
             if self.cache_file.exists():
-                # Check if cache is from today
                 cache_age = time.time() - self.cache_file.stat().st_mtime
-                if cache_age < 86400:  # 24 hours
-                    data = json.loads(self.cache_file.read_text())
-                    return data
-        except Exception as e:
+                if cache_age < CACHE_EXPIRY_SECONDS:
+                    with open(self.cache_file, 'r') as f:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                        data = json.load(f)
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        return data
+        except (json.JSONDecodeError, OSError, IOError) as e:
             logging.debug(f"Failed to load previous stats: {e}")
         return None
 
     def _save_current_stats(self, lines_added: int, lines_removed: int):
-        """Save current session stats to cache"""
+        """Save current session stats to cache with file locking"""
         try:
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
             data = {
@@ -149,30 +245,50 @@ class StatsTracker:
                 'lines_removed': lines_removed,
                 'timestamp': time.time()
             }
-            self.cache_file.write_text(json.dumps(data))
-        except Exception as e:
+
+            # Use temp file + atomic rename for safety
+            temp_file = self.cache_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            temp_file.rename(self.cache_file)
+
+        except (OSError, IOError) as e:
             logging.debug(f"Failed to save stats: {e}")
 
-    def get_trend_arrow(self, current_added: int, current_removed: int) -> str:
-        """Calculate trend arrow based on comparison with previous session"""
+    def calculate_trend(self, current_added: int, current_removed: int) -> str:
+        """Calculate trend arrow (pure function, no side effects)"""
         prev = self._load_previous_stats()
 
-        # Save current stats for next time
-        self._save_current_stats(current_added, current_removed)
-
         if not prev:
-            return ''  # No previous data to compare
+            return ' (new)'  # First session indicator
 
-        # Calculate total lines changed
         current_total = current_added + current_removed
         prev_total = prev.get('lines_added', 0) + prev.get('lines_removed', 0)
 
-        if current_total > prev_total * 1.2:  # 20% more changes
+        if prev_total == 0:
+            return ' ↗' if current_total > 0 else ''
+
+        ratio = current_total / prev_total
+        if ratio > 1 + TREND_THRESHOLD:
             return ' ↗'
-        elif current_total < prev_total * 0.8:  # 20% fewer changes
+        elif ratio < 1 - TREND_THRESHOLD:
             return ' ↘'
-        else:
-            return ' →'  # Similar activity level
+        return ' →'
+
+    def save_session_stats(self, lines_added: int, lines_removed: int):
+        """Save current session stats (explicit side effect)"""
+        self._save_current_stats(lines_added, lines_removed)
+
+    def get_trend_and_save(self, current_added: int, current_removed: int) -> str:
+        """Get trend arrow and save stats (combined operation with clear naming)"""
+        trend = self.calculate_trend(current_added, current_removed)
+        self.save_session_stats(current_added, current_removed)
+        return trend
 
 # ===================== Claude Context Parser =====================
 def parse_claude_context() -> Dict[str, Any]:
@@ -182,6 +298,7 @@ def parse_claude_context() -> Dict[str, Any]:
         'dir': '.',
         'cwd': '.',
         'branch': '',
+        'detached': False,  # True if in detached HEAD state
         'cost_usd': 0.0,
         'cost_str': None,
         'duration': None,
@@ -205,14 +322,22 @@ def parse_claude_context() -> Dict[str, Any]:
                 result['cwd'] = cwd
                 result['dir'] = Path(cwd).name
 
-                # Check for git branch
+                # Check for git branch (handle detached HEAD)
                 git_head = Path(cwd) / '.git' / 'HEAD'
                 if git_head.exists():
-                    content = git_head.read_text().strip()
-                    if content.startswith('ref: '):
-                        result['branch'] = content.split('/')[-1]
+                    try:
+                        content = git_head.read_text().strip()
+                        if content.startswith('ref: '):
+                            # Normal branch reference
+                            result['branch'] = content.split('/')[-1]
+                        else:
+                            # Detached HEAD - show short commit hash
+                            result['branch'] = content[:7]
+                            result['detached'] = True
+                    except (OSError, IOError):
+                        pass
 
-            # Parse cost metrics (important for tracking usage)
+            # Parse cost metrics
             if 'cost' in data:
                 # Cost in USD
                 cost_usd = data['cost'].get('total_cost_usd') or data['cost'].get('usd')
@@ -220,22 +345,23 @@ def parse_claude_context() -> Dict[str, Any]:
                     result['cost_usd'] = float(cost_usd)
                     result['cost_str'] = f"${cost_usd:.3f}"
 
-                # Parse duration - show seconds if less than 1 minute
-                duration_sec = data['cost'].get('total_duration_ms') or data['cost'].get('duration_sec')
-                if duration_sec is not None and duration_sec > 0:
-                    # Handle both ms and sec
+                # Parse duration (handle both ms and sec formats)
+                duration_value = data['cost'].get('total_duration_ms') or data['cost'].get('duration_sec')
+                if duration_value is not None and duration_value > 0:
+                    # Convert to seconds if value was in milliseconds
                     if data['cost'].get('total_duration_ms'):
-                        duration_sec = duration_sec / 1000
+                        duration_seconds = duration_value / 1000
+                    else:
+                        duration_seconds = duration_value
 
-                    minutes = int(duration_sec // 60)
+                    minutes = int(duration_seconds // 60)
                     if minutes > 0:
                         result['duration'] = f"{minutes}m"
                     else:
-                        # Show seconds for sessions under 1 minute
-                        seconds = int(duration_sec)
+                        seconds = int(duration_seconds)
                         result['duration'] = f"{seconds}s"
 
-                # Parse code change stats (THE COOLEST METRICS!)
+                # Parse code change stats
                 lines_added = data['cost'].get('total_lines_added')
                 if lines_added is not None:
                     result['lines_added'] = int(lines_added)
@@ -244,12 +370,12 @@ def parse_claude_context() -> Dict[str, Any]:
                 if lines_removed is not None:
                     result['lines_removed'] = int(lines_removed)
 
-                # Parse API performance
+                # Parse API performance (cumulative time)
                 api_duration = data['cost'].get('total_api_duration_ms')
                 if api_duration is not None:
                     result['api_duration_ms'] = int(api_duration)
 
-    except Exception as e:
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
         logging.debug(f"Failed to parse Claude context: {e}")
 
     return result
@@ -264,8 +390,9 @@ def main():
     setup_logging(config)
     logging.info("Productivity StatusLine started")
 
-    # Validate configuration
-    if not config.validate():
+    # Ensure directories exist and validate config
+    config.ensure_directories()
+    if not config.is_valid():
         print("ERROR: Configuration invalid")
         sys.exit(1)
 
@@ -276,47 +403,38 @@ def main():
     # Check git dirty status
     is_dirty = GitStatusChecker.check_dirty_status(context['cwd'])
 
-    # Get code change trend
+    # Get code change trend (using renamed method with clear semantics)
     tracker = StatsTracker(config)
-    trend_arrow = tracker.get_trend_arrow(context['lines_added'], context['lines_removed'])
-
-    # Format output with colors (eye-friendly palette)
-    if not config.no_color:
-        ORANGE = '\033[38;5;173m'    # Model name - soft orange-brown
-        CYAN = '\033[38;5;87m'       # Cost/metrics - soft cyan-green
-        DIM = '\033[2m'              # Directory
-        GREEN = '\033[38;5;78m'      # Code stats - soft green
-        YELLOW = '\033[38;5;185m'    # Performance - warm yellow
-        RED = '\033[38;5;167m'       # Warning - muted red
-        RESET = '\033[0m'
-    else:
-        ORANGE = CYAN = DIM = GREEN = YELLOW = RED = RESET = ''
+    trend_arrow = tracker.get_trend_and_save(context['lines_added'], context['lines_removed'])
 
     # Build header with current time
     current_time = datetime.now().strftime('%H:%M')
     header = f"⏰ {current_time}"
 
     # Add model info
-    header += f" | {ORANGE}{context['model']}{RESET}"
+    header += f" | {Colors.ORANGE}{context['model']}{Colors.RESET}"
 
     # Add directory and branch with dirty indicator
-    header += f" {DIM}{context['dir']}{RESET}"
+    header += f" {Colors.DIM}{context['dir']}{Colors.RESET}"
     if context['branch']:
-        header += f":{context['branch']}"
+        if context.get('detached'):
+            # Detached HEAD - show with @ prefix
+            header += f":{Colors.DIM}@{context['branch']}{Colors.RESET}"
+        else:
+            header += f":{context['branch']}"
         if is_dirty:
-            header += f"{RED}*{RESET}"  # Dirty indicator
+            header += f"{Colors.RED}●{Colors.RESET}"  # Enhanced dirty indicator
 
     # Add cost metrics with alert if threshold exceeded
     metrics = []
     if context.get('cost_str'):
         cost_display = context['cost_str']
-        # Add warning if cost exceeds threshold
         if context['cost_usd'] > config.cost_threshold:
-            cost_display += f" {RED}⚠️{RESET}"
-        metrics.append(f"{CYAN}{cost_display}{RESET}")
+            cost_display += f" {Colors.RED}⚠️{Colors.RESET}"
+        metrics.append(f"{Colors.CYAN}{cost_display}{Colors.RESET}")
 
     if context.get('duration'):
-        metrics.append(f"{CYAN}{context['duration']}{RESET}")
+        metrics.append(f"{Colors.CYAN}{context['duration']}{Colors.RESET}")
 
     if metrics:
         header += f" [{' '.join(metrics)}]"
@@ -324,31 +442,35 @@ def main():
     # Build productivity metrics part
     productivity_parts = []
 
-    # Code change statistics (THE STAR OF THE SHOW!)
+    # Code change statistics
     lines_added = context['lines_added']
     lines_removed = context['lines_removed']
     if lines_added > 0 or lines_removed > 0:
-        code_stats = f"{GREEN}📝 +{lines_added}/-{lines_removed}{trend_arrow}{RESET}"
+        code_stats = f"{Colors.GREEN}📝 +{lines_added}/-{lines_removed}{trend_arrow}{Colors.RESET}"
         productivity_parts.append(code_stats)
     else:
-        productivity_parts.append(f"{DIM}📝 No changes yet{RESET}")
+        # Simplified "no changes" display
+        productivity_parts.append(f"{Colors.DIM}📝 0/0{trend_arrow}{Colors.RESET}")
 
-    # API performance indicator
+    # API performance indicator (using cumulative thresholds)
     api_duration = context['api_duration_ms']
     if api_duration > 0:
         # Format API duration nicely
         if api_duration < 1000:
             api_str = f"{api_duration}ms"
-        else:
+        elif api_duration < 60000:
             api_str = f"{api_duration/1000:.1f}s"
-
-        # Color based on performance (green=fast, yellow=ok, red=slow)
-        if api_duration < 500:
-            perf_display = f"{GREEN}⚡{api_str}{RESET}"
-        elif api_duration < 2000:
-            perf_display = f"{YELLOW}⚡{api_str}{RESET}"
         else:
-            perf_display = f"{RED}⚡{api_str}{RESET}"
+            # Show minutes for very long sessions
+            api_str = f"{api_duration/60000:.1f}m"
+
+        # Color based on cumulative performance thresholds
+        if api_duration < PERF_FAST_MS:
+            perf_display = f"{Colors.GREEN}⚡{api_str}{Colors.RESET}"
+        elif api_duration < PERF_MODERATE_MS:
+            perf_display = f"{Colors.YELLOW}⚡{api_str}{Colors.RESET}"
+        else:
+            perf_display = f"{Colors.RED}⚡{api_str}{Colors.RESET}"
 
         productivity_parts.append(perf_display)
 
@@ -356,7 +478,7 @@ def main():
     if productivity_parts:
         output = f"{header} | {' | '.join(productivity_parts)}"
     else:
-        output = f"{header} | {DIM}Initializing...{RESET}"
+        output = f"{header} | {Colors.DIM}Initializing...{Colors.RESET}"
 
     # Output (first line only, as per official docs)
     print(output)
@@ -364,9 +486,12 @@ def main():
     logging.info(f"Productivity status displayed: +{lines_added}/-{lines_removed}, API: {api_duration}ms")
     logging.info("Execution completed")
 
+
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        sys.exit(0)
     except Exception as e:
         logging.error(f"Unhandled exception: {e}", exc_info=True)
         print(f"ERROR: {e}")

@@ -26,7 +26,7 @@ chmod +x ~/.claude/statusline-hz.py
 ## Example Output
 
 ```
-⏰ 14:30 | Sonnet 4.5 statusline:main* [$0.125 5m] | 📝 +127/-43 ↗ | ⚡230ms
+⏰ 14:30 | Sonnet 4.5 statusline:main● [$0.125 5m] | 📝 +127/-43 ↗ | ⚡5.0s
 ```
 
 **Output Breakdown:**
@@ -35,10 +35,10 @@ chmod +x ~/.claude/statusline-hz.py
 |---------|-------------|
 | `⏰ 14:30` | Current time |
 | `Sonnet 4.5` | AI model name (color: orange) |
-| `statusline:main*` | Directory:branch (dirty indicator `*`) |
+| `statusline:main●` | Directory:branch (dirty indicator `●`) |
 | `[$0.125 5m]` | Session cost and duration (color: cyan) |
 | `📝 +127/-43 ↗` | Lines added/removed with trend arrow (color: green) |
-| `⚡230ms` | API response time (color-coded by speed) |
+| `⚡5.0s` | Cumulative API time (color-coded by session length) |
 
 ## Features
 
@@ -52,10 +52,13 @@ chmod +x ~/.claude/statusline-hz.py
 
 ### Advanced Features
 
-- **Trend Analysis** - Compare current session with previous (`↗` increased, `→` similar, `↘` decreased)
+- **Trend Analysis** - Compare current session with previous (`↗` increased, `→` similar, `↘` decreased, `(new)` first session)
 - **Cost Alerts** - Warning emoji `⚠️` when cost exceeds threshold
 - **Smart Color Coding** - Visual hierarchy for quick information parsing
 - **Graceful Degradation** - Works even without git or with invalid configuration
+- **Detached HEAD Support** - Shows short commit hash with `@` prefix when not on a branch
+- **Git Status Caching** - 5-second cache for performance optimization
+- **File Locking** - Safe concurrent access for multi-instance usage
 
 ## Requirements
 
@@ -109,18 +112,21 @@ The statusline will appear at the bottom of your Claude Code interface.
 
 ### Performance Indicators
 
-#### API Response Time Colors
+#### Cumulative API Time Colors
+
+The API time shown is the **cumulative** time spent on API calls during the session:
 
 | Color | Range | Meaning |
 |-------|-------|---------|
-| 🟢 Green | < 500ms | Fast, excellent performance |
-| 🟡 Yellow | 500ms - 2s | Moderate, acceptable performance |
-| 🔴 Red | > 2s | Slow, may need attention |
+| 🟢 Green | < 10s | Fast session, minimal API usage |
+| 🟡 Yellow | 10s - 60s | Normal session, moderate API usage |
+| 🔴 Red | > 60s | Long session, significant API usage |
 
 #### Trend Arrows
 
 | Arrow | Meaning |
 |-------|---------|
+| `(new)` | First session (no previous data to compare) |
 | `↗` | Activity increased (>20% more changes) |
 | `→` | Similar activity level (±20%) |
 | `↘` | Activity decreased (>20% fewer changes) |
@@ -197,9 +203,19 @@ echo '{
     "total_duration_ms": 300000,
     "total_lines_added": 127,
     "total_lines_removed": 43,
-    "total_api_duration_ms": 230
+    "total_api_duration_ms": 5000
   }
 }' | python3 statusline-hz.py
+```
+
+### Running Unit Tests
+
+```bash
+# Run all tests
+python3 tests/test_statusline.py -v
+
+# Or with pytest (if installed)
+pytest tests/test_statusline.py -v
 ```
 
 ### Enable Debug Logging
@@ -210,6 +226,13 @@ export STATUSLINE_DEBUG=1
 ```
 
 Logs are written to: `~/.cache/claude-statusline/logs/statusline-YYYYMMDD.log`
+
+### Performance Notes
+
+According to [Claude Code official documentation](https://code.claude.com/docs/en/statusline):
+- Statusline updates are throttled to every 300ms
+- Git status checks are cached for 5 seconds to stay within this budget
+- Log cleanup runs once per day to minimize I/O overhead
 
 ## License
 
